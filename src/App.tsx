@@ -2,6 +2,7 @@ import { useState, useEffect, useCallback, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
 import { openUrl } from "@tauri-apps/plugin-opener";
+import { listen } from "@tauri-apps/api/event";
 import { SearchableSelect } from "./components/SearchableSelect";
 import type {
   Config,
@@ -31,7 +32,9 @@ function App() {
   const [error, setError] = useState<string | null>(null);
   const [successMessage, setSuccessMessage] = useState<string | null>(null);
   const [zoomPos, setZoomPos] = useState<{ x: number; y: number } | null>(null);
+  const [isDragging, setIsDragging] = useState(false);
   const imageRef = useRef<HTMLImageElement>(null);
+  const dropZoneRef = useRef<HTMLDivElement>(null);
 
   const selectedReceipt = receipts.find((r) => r.id === selectedReceiptId);
 
@@ -64,6 +67,77 @@ function App() {
     }
   }, []);
 
+  // ファイルパスからレシートを追加する共通関数
+  const addReceiptsFromPaths = useCallback(async (filePaths: string[]) => {
+    if (filePaths.length === 0) return;
+
+    // 現在のレシートのハッシュを取得（関数型更新でアクセス）
+    const processedReceipts: Receipt[] = [];
+    const processedHashes = new Set<string>();
+    let skippedCount = 0;
+
+    for (const file of filePaths) {
+      // 拡張子チェック
+      const ext = file.split(".").pop()?.toLowerCase();
+      if (!["jpg", "jpeg", "png", "webp", "pdf"].includes(ext || "")) {
+        continue;
+      }
+
+      try {
+        const hash = await invoke<string>("calculate_image_hash", {
+          imagePath: file,
+        });
+
+        // 今回処理中のファイルで重複チェック
+        if (processedHashes.has(hash)) {
+          skippedCount++;
+          continue;
+        }
+
+        const base64 = await invoke<string>("read_image_base64", {
+          imagePath: file,
+        });
+
+        processedReceipts.push({
+          id: crypto.randomUUID(),
+          imagePath: file,
+          imageHash: hash,
+          imageBase64: base64,
+          status: "pending",
+          details: [],
+        });
+        processedHashes.add(hash);
+      } catch (e) {
+        console.error(`Failed to load file: ${file}`, e);
+      }
+    }
+
+    if (processedReceipts.length > 0) {
+      // 関数型更新で既存のレシートと重複チェック
+      setReceipts((prev) => {
+        const existingHashes = new Set(prev.map((r) => r.imageHash));
+        const newReceipts = processedReceipts.filter(
+          (r) => !existingHashes.has(r.imageHash),
+        );
+        const duplicateCount = processedReceipts.length - newReceipts.length;
+
+        if (duplicateCount > 0) {
+          setSuccessMessage(
+            `${newReceipts.length}件追加しました（${duplicateCount + skippedCount}件は重複のためスキップ）`,
+          );
+        } else if (skippedCount > 0) {
+          setSuccessMessage(
+            `${newReceipts.length}件追加しました（${skippedCount}件は重複のためスキップ）`,
+          );
+        } else {
+          setSuccessMessage(`${newReceipts.length}件追加しました`);
+        }
+
+        return [...prev, ...newReceipts];
+      });
+    }
+  }, []);
+
   // 初期化
   useEffect(() => {
     (async () => {
@@ -73,6 +147,58 @@ function App() {
       }
     })();
   }, [loadConfig, loadMasterData]);
+
+  // ドラッグ&ドロップイベントのリスナー
+  const isProcessingDrop = useRef(false);
+
+  useEffect(() => {
+    let unlistenDrop: (() => void) | undefined;
+    let unlistenHover: (() => void) | undefined;
+    let unlistenCancel: (() => void) | undefined;
+    let isMounted = true;
+
+    const setupListeners = async () => {
+      unlistenHover = await listen<{ paths: string[] }>(
+        "tauri://drag-over",
+        () => {
+          if (isMounted) setIsDragging(true);
+        },
+      );
+
+      unlistenCancel = await listen("tauri://drag-leave", () => {
+        if (isMounted) setIsDragging(false);
+      });
+
+      unlistenDrop = await listen<{ paths: string[] }>(
+        "tauri://drag-drop",
+        async (event) => {
+          if (!isMounted) return;
+          setIsDragging(false);
+
+          // 重複実行を防ぐ
+          if (isProcessingDrop.current) return;
+          isProcessingDrop.current = true;
+
+          try {
+            if (event.payload.paths && event.payload.paths.length > 0) {
+              await addReceiptsFromPaths(event.payload.paths);
+            }
+          } finally {
+            isProcessingDrop.current = false;
+          }
+        },
+      );
+    };
+
+    setupListeners();
+
+    return () => {
+      isMounted = false;
+      unlistenDrop?.();
+      unlistenHover?.();
+      unlistenCancel?.();
+    };
+  }, [addReceiptsFromPaths]);
 
   // freee認証
   const handleFreeeAuth = async () => {
@@ -178,35 +304,7 @@ function App() {
       });
 
       if (!files || files.length === 0) return;
-
-      const existingHashes = new Set(receipts.map((r) => r.imageHash));
-      const newReceipts: Receipt[] = [];
-
-      for (const file of files) {
-        const hash = await invoke<string>("calculate_image_hash", {
-          imagePath: file,
-        });
-
-        if (existingHashes.has(hash)) {
-          continue; // 重複をスキップ
-        }
-
-        const base64 = await invoke<string>("read_image_base64", {
-          imagePath: file,
-        });
-
-        newReceipts.push({
-          id: crypto.randomUUID(),
-          imagePath: file,
-          imageHash: hash,
-          imageBase64: base64,
-          status: "pending",
-          details: [],
-        });
-        existingHashes.add(hash);
-      }
-
-      setReceipts((prev) => [...prev, ...newReceipts]);
+      await addReceiptsFromPaths(files);
     } catch (e) {
       setError(`ファイル選択に失敗しました: ${e}`);
     }
@@ -761,7 +859,7 @@ function App() {
           /* メイン画面 */
           <div className="flex gap-6">
             {/* 左: レシート一覧 */}
-            <div className="w-1/3 bg-white rounded-lg shadow p-4">
+            <div className="w-1/3 bg-white rounded-lg shadow p-4 relative">
               <div className="flex justify-between items-center mb-4">
                 <h2 className="text-lg font-bold">レシート一覧</h2>
                 <div className="flex gap-2">
@@ -785,51 +883,90 @@ function App() {
               </div>
 
               {receipts.length === 0 ? (
-                <p className="text-gray-500 text-center py-8">
-                  レシート画像を選択してください
-                </p>
-              ) : (
-                <ul className="space-y-2 max-h-[600px] overflow-y-auto">
-                  {receipts.map((receipt) => (
-                    <li
-                      key={receipt.id}
-                      onClick={() => setSelectedReceiptId(receipt.id)}
-                      className={`p-3 rounded cursor-pointer border ${
-                        selectedReceiptId === receipt.id
-                          ? "border-blue-500 bg-blue-50"
-                          : "border-gray-200 hover:bg-gray-50"
-                      }`}
+                <div
+                  ref={dropZoneRef}
+                  className={`border-2 border-dashed rounded-lg py-12 text-center transition-colors ${
+                    isDragging
+                      ? "border-blue-500 bg-blue-50"
+                      : "border-gray-300 hover:border-gray-400"
+                  }`}
+                >
+                  <div className="text-gray-500">
+                    <svg
+                      className="mx-auto h-12 w-12 text-gray-400"
+                      stroke="currentColor"
+                      fill="none"
+                      viewBox="0 0 48 48"
                     >
-                      <div className="flex justify-between items-start">
-                        <div className="flex-1 min-w-0">
-                          <p className="text-sm font-medium truncate">
-                            {receipt.storeName ||
-                              receipt.imagePath.split("/").pop()}
-                          </p>
-                          {receipt.date && (
-                            <p className="text-xs text-gray-500">
-                              {receipt.date}
+                      <path
+                        d="M28 8H12a4 4 0 00-4 4v20m32-12v8m0 0v8a4 4 0 01-4 4H12a4 4 0 01-4-4v-4m32-4l-3.172-3.172a4 4 0 00-5.656 0L28 28M8 32l9.172-9.172a4 4 0 015.656 0L28 28m0 0l4 4m4-24h8m-4-4v8m-12 4h.02"
+                        strokeWidth={2}
+                        strokeLinecap="round"
+                        strokeLinejoin="round"
+                      />
+                    </svg>
+                    <p className="mt-2">
+                      {isDragging
+                        ? "ここにドロップしてください"
+                        : "レシート画像をドラッグ&ドロップ"}
+                    </p>
+                    <p className="text-xs mt-1">
+                      または「選択」ボタンをクリック
+                    </p>
+                  </div>
+                </div>
+              ) : (
+                <>
+                  {/* ドラッグ中のオーバーレイ */}
+                  {isDragging && (
+                    <div className="absolute inset-0 bg-blue-500 bg-opacity-20 border-2 border-dashed border-blue-500 rounded-lg z-10 flex items-center justify-center">
+                      <p className="text-blue-700 font-medium text-lg">
+                        ここにドロップして追加
+                      </p>
+                    </div>
+                  )}
+                  <ul className="space-y-2 max-h-[600px] overflow-y-auto">
+                    {receipts.map((receipt) => (
+                      <li
+                        key={receipt.id}
+                        onClick={() => setSelectedReceiptId(receipt.id)}
+                        className={`p-3 rounded cursor-pointer border ${
+                          selectedReceiptId === receipt.id
+                            ? "border-blue-500 bg-blue-50"
+                            : "border-gray-200 hover:bg-gray-50"
+                        }`}
+                      >
+                        <div className="flex justify-between items-start">
+                          <div className="flex-1 min-w-0">
+                            <p className="text-sm font-medium truncate">
+                              {receipt.storeName ||
+                                receipt.imagePath.split("/").pop()}
                             </p>
-                          )}
-                          {receipt.details.length > 0 && (
-                            <p className="text-sm font-bold">
-                              ¥
-                              {receipt.details
-                                .reduce((sum, d) => sum + d.amount, 0)
-                                .toLocaleString()}
-                              {receipt.details.length > 1 && (
-                                <span className="text-xs text-gray-500 ml-1">
-                                  ({receipt.details.length}件)
-                                </span>
-                              )}
-                            </p>
-                          )}
+                            {receipt.date && (
+                              <p className="text-xs text-gray-500">
+                                {receipt.date}
+                              </p>
+                            )}
+                            {receipt.details.length > 0 && (
+                              <p className="text-sm font-bold">
+                                ¥
+                                {receipt.details
+                                  .reduce((sum, d) => sum + d.amount, 0)
+                                  .toLocaleString()}
+                                {receipt.details.length > 1 && (
+                                  <span className="text-xs text-gray-500 ml-1">
+                                    ({receipt.details.length}件)
+                                  </span>
+                                )}
+                              </p>
+                            )}
+                          </div>
+                          <StatusBadge status={receipt.status} />
                         </div>
-                        <StatusBadge status={receipt.status} />
-                      </div>
-                    </li>
-                  ))}
-                </ul>
+                      </li>
+                    ))}
+                  </ul>
+                </>
               )}
             </div>
 
